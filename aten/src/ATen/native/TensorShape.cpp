@@ -56,7 +56,7 @@ inline c10::MemoryFormat cat_compute_output_memory_format(const MaterializedITen
   return format.value();
 }
 
-TORCH_PRECOMPUTE_META_FUNC(cat)(ITensorListRef tensors, int64_t dim) {
+TORCH_PRECOMPUTE_META_FUNC(cat)(const ITensorListRef& tensors, int64_t dim) {
   // previously, size [0] tensors were the only possible empty tensors; thus, it wasn't possible
   // to cat empty tensors unless all the other tensors were 1-dimensional, so we allowed these tensors
   // to be "skipped".  We maintain this behavior for backwards compatibility, but only for this specific
@@ -307,7 +307,7 @@ std::vector<Tensor> broadcast_tensors(TensorList tensors) {
 }
 
 TORCH_IMPL_FUNC(cat_out_cpu)
-(ITensorListRef tensors,
+(const ITensorListRef& tensors,
  int64_t dim,
  int64_t valid,
  bool all_contiguous,
@@ -438,7 +438,7 @@ static void check_cat_sparse_dims(Tensor const &t,
             ", but tensor at position ", pos, " has ", t.sparse_dim(), ", ", t.dense_dim(), ".");
 }
 
-static Tensor cat_sparse_impl(TensorList tensors, int64_t dim) {
+static Tensor cat_sparse_impl(ITensorList tensors, int64_t dim) {
   std::vector<Tensor> indices;
   std::vector<Tensor> values;
   int64_t wrapped = maybe_wrap_dim(dim, tensors[0].dim());
@@ -552,7 +552,7 @@ static Tensor cat_sparse_impl(TensorList tensors, int64_t dim) {
   }
 }
 
-Tensor cat_sparse(TensorList tensors, int64_t dim) {
+Tensor cat_sparse(const ITensorList& tensors, int64_t dim) {
   auto maybe_outnames = namedinference::compute_cat_outnames(tensors);
   auto result = cat_sparse_impl(tensors, at::legacy_cat_wrap_dim(dim, tensors));
   namedinference::propagate_names_if_nonempty(result, maybe_outnames);

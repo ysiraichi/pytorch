@@ -406,7 +406,7 @@ void parallel_cat(const Tensor &out, ITensorListRef inputs, int64_t dimension,
 } // namespace
 
 TORCH_IMPL_FUNC(cat_out_cuda)
-(ITensorListRef tensors,
+(const ITensorListRef& tensors,
  int64_t dim,
  int64_t valid,
  bool all_contiguous,
