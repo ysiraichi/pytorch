@@ -1581,6 +1581,9 @@ class ShapeEnv:
                 if len(bounds) > 1:
                     exprs.append(" <= ".join(bounds))
 
+        print(f"GUARDS: {len(exprs)}")
+        # for e in exprs:
+        #     print(f"> {e}")
         return exprs
 
     def evaluate_guards_for_args(self, placeholders, args):
