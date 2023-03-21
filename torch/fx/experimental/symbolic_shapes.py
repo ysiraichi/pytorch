@@ -1550,41 +1550,36 @@ class ShapeEnv:
 
         # 2. Every guard must evaluate to True (but remember many guards
         #    like s0 == s1*2 because trivial due to simplification)
-        def simplify_until_no_change(expr: sympy.Expr) -> sympy.Expr:
-            new_expr = self.simplify(expr)
-            while new_expr != expr:
+        def simplify_until(expr: sympy.Expr, iterations: int = 10) -> sympy.Expr:
+            simplify = lambda e: self.maybe_simplify_floordiv(self.simplify(e))
+            new_expr = simplify(expr)
+            it = 0
+
+            while new_expr != expr and it < iterations:
                 expr = new_expr
-                new_expr = self.simplify(expr)
+                new_expr = simplify(expr)
+                it += 1
+
             return expr
 
-        simplified_guards = [(simplify_until_no_change(g), tb) for g, tb in self.guards]
+        simplified_guards = [(simplify_until(g), tb) for g, tb in self.guards]
         var_to_guards = dict()
         var_to_range = self.var_to_range.copy()
-        unhandled_guards = []
 
         for g, tb in simplified_guards:
-            if self._maybe_evaluate_static_impl(g, var_to_range=var_to_range) is not None:
-                continue
-
-            if not isinstance(g, sympy.Rel):
-                unhandled_guards.append((g, tb))
+            if (
+                    not isinstance(g, sympy.Rel)
+                    or not isinstance(g.lhs, sympy.Symbol)
+                    or g.lhs not in var_to_range
+            ):
                 continue
 
             symbol = g.lhs
 
-            if not isinstance(g.lhs, sympy.Symbol):
-                unhandled_guards.append((g, tb))
-                continue
-
-            assert symbol in self.var_to_range
-
-            # Consider actually issuing the guard if it is used for refining
-            # the value range of a symbol. Otherwise, it is discarded.
-
             vr = var_to_range[symbol]
             lower, upper = vr.lower, vr.upper
 
-            rhs_vr = sympy_interp(ValueRangeAnalysis, self.var_to_range, g.rhs)
+            rhs_vr = sympy_interp(ValueRangeAnalysis, self.var_to_range, g.rhs)  # type: ignore
             lower_guard, upper_guard = var_to_guards.get(symbol, (None, None))
 
             if lower < rhs_vr.lower and isinstance(g, (sympy.Eq, sympy.Ge, sympy.Gt)):
@@ -1594,8 +1589,6 @@ class ShapeEnv:
                 upper = rhs_vr.upper - (1 * isinstance(g, sympy.Lt))
                 upper_guard = (g, tb)
 
-            # If the value range is still the same, ignore the guard.
-            # i.e. the guard didn't provide any additional information for this symbol.
             if vr == ValueRanges(lower, upper):
                 continue
 
@@ -1604,7 +1597,7 @@ class ShapeEnv:
 
         # First, issue the unhandled guards. i.e. guards we can't prove that are
         # not useful.
-        for g, tb in unhandled_guards:
+        for g, tb in simplified_guards:
             if self._maybe_evaluate_static_impl(g, var_to_range=var_to_range) is not None:
                 continue
 
@@ -1808,8 +1801,34 @@ class ShapeEnv:
         self.divisible = new_divisible
 
     @_lru_cache
+    def maybe_simplify_floordiv(self, expr: "sympy.Expr") -> "sympy.Expr":
+        if isinstance(expr, sympy.Eq) and isinstance(expr.lhs, FloorDiv):
+            numerator, denominator = expr.lhs.args
+            expr = sympy.And(
+                sympy.Ge(numerator - (expr.rhs * denominator), 0),  # type: ignore
+                sympy.Lt(numerator - ((expr.rhs + 1) * denominator), 0)  # type: ignore
+            )
+        if isinstance(expr, sympy.Ne) and isinstance(expr.lhs, FloorDiv):
+            numerator, denominator = expr.lhs.args
+            expr = sympy.Or(
+                sympy.Lt(numerator - (expr.rhs * denominator), 0),  # type: ignore
+                sympy.Ge(numerator - ((expr.rhs + 1) * denominator), 0)  # type: ignore
+            )
+        if isinstance(expr, (sympy.Gt, sympy.Ge)) and isinstance(expr.lhs, FloorDiv):
+            quotient = expr.rhs if isinstance(expr, sympy.Ge) else (expr.rhs + 1)  # type: ignore
+            expr = sympy.Ge(expr.lhs.args[0] - (quotient * expr.lhs.args[1]), 0)  # type: ignore
+        if isinstance(expr, (sympy.Lt, sympy.Le)) and isinstance(expr.lhs, FloorDiv):
+            quotient = expr.rhs if isinstance(expr, sympy.Lt) else (expr.rhs + 1)  # type: ignore
+            expr = sympy.Lt(expr.lhs.args[0] - (quotient * expr.lhs.args[1]), 0)  # type: ignore
+
+        return expr
+
+    @_lru_cache
     def simplify(self, expr: "sympy.Expr") -> "sympy.Expr":
-        def get_const(expr):
+        def get_added_const(expr):
+            """
+            Returns an integer constant being added at the top-level of this expression.
+            """
             if isinstance(expr, sympy.Integer):
                 return expr
             elif isinstance(expr, sympy.Add):
@@ -1852,34 +1871,16 @@ class ShapeEnv:
             # divisions simplified away
             if new_pows.issubset(pows) and new_rationals.issubset(rationals):
                 expr = new_expr
-
         if isinstance(expr, sympy.Rel):
-            lhs_const = get_const(expr.lhs)
-            rhs_const = get_const(expr.rhs)
+            lhs_const = get_added_const(expr.lhs)
+            rhs_const = get_added_const(expr.rhs)
             if (
                     lhs_const is not None
                     and rhs_const is not None
                     and lhs_const != 0
             ):
                 expr = type(expr)(expr.lhs - lhs_const, expr.rhs - lhs_const)  # type: ignore
-        if isinstance(expr, sympy.Eq) and isinstance(expr.lhs, FloorDiv):
-            numerator, denominator = expr.lhs.args
-            expr = sympy.And(
-                sympy.Ge(numerator - (expr.rhs * denominator), 0),  # type: ignore
-                sympy.Lt(numerator - ((expr.rhs + 1) * denominator), 0)  # type: ignore
-            )
-        if isinstance(expr, sympy.Ne) and isinstance(expr.lhs, FloorDiv):
-            numerator, denominator = expr.lhs.args
-            expr = sympy.Or(
-                sympy.Lt(numerator - (expr.rhs * denominator), 0),  # type: ignore
-                sympy.Ge(numerator - ((expr.rhs + 1) * denominator), 0)  # type: ignore
-            )
-        if isinstance(expr, (sympy.Gt, sympy.Ge)) and isinstance(expr.lhs, FloorDiv):
-            quotient = expr.rhs if isinstance(expr, sympy.Ge) else (expr.rhs + 1)  # type: ignore
-            expr = sympy.Ge(expr.lhs.args[0] - (quotient * expr.lhs.args[1]), 0)  # type: ignore
-        if isinstance(expr, (sympy.Lt, sympy.Le)) and isinstance(expr.lhs, FloorDiv):
-            quotient = expr.rhs if isinstance(expr, sympy.Lt) else (expr.rhs + 1)  # type: ignore
-            expr = sympy.Lt(expr.lhs.args[0] - (quotient * expr.lhs.args[1]), 0)  # type: ignore
+
         return expr
 
     @lru_cache(256)
