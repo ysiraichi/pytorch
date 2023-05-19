@@ -2210,6 +2210,7 @@ class ShapeEnv:
             self.validator = TranslationValidator()
             self.tracer = torch.fx.Tracer()
             self.tracer.graph = torch.fx.Graph()
+            self.graph_added_nodes: Dict[Tuple[Callable, Tuple[Any, ...]], torch.fx.Node] = {}
 
     def freeze(self):
         self.frozen = True
@@ -2238,11 +2239,13 @@ Failed inputs:
 {failed_inputs}""")
 
     def create_fx_call_function(self, op: Callable, args: Tuple, pytype: Optional[Type]) -> Optional[torch.fx.Node]:
-        if _translation_validator_enabled():
+        node_key = (op, args)
+        if _translation_validator_enabled() and node_key not in self.graph_added_nodes:
             assert all(a is not None for a in args), f"missing arg in FX graph ({op.__name__}): {args}"
             node = self.tracer.create_node("call_function", _operator_to_z3(op), args, {})
             node.meta["pytype"] = pytype
-            return node
+            self.graph_added_nodes[node_key] = node
+        return self.graph_added_nodes.get(node_key, None)
 
     def create_fx_placeholder(
             self,
@@ -3206,14 +3209,6 @@ Failed inputs:
             return orig_expr
 
         expr = orig_expr
-
-        # At first, we generate the guard without enabling SymPy evaluation.
-        # This helps us check if SymPy is doing something wrong.
-        with sympy.evaluate(False):
-            g = guard_from(expr, concrete_val)
-
-        if not self._suppress_guards_tls():
-            self._add_input_guard(g)  # type: ignore
 
         static_expr = self._maybe_evaluate_static(expr)
         if static_expr is not None:
