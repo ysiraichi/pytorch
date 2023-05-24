@@ -565,6 +565,9 @@ class SymNode:
             self._hint_expr = None
             self._hint = hint
         self.constant: Optional[Union[int, float, bool]] = constant
+        # Record the FX node of the current node if we are doing translation
+        # validation. They will be used for building the input assertions for
+        # the translation validation problem.
         self.fxnode = fxnode if _translation_validator_enabled() else None
 
     @property
@@ -1210,6 +1213,8 @@ def _make_node_magic(method, func):
         else:
             pytype = self.pytype
 
+        # Create a FX node that corresponds to the operation being applied to
+        # this node.
         fxnode = self.shape_env.create_fx_call_function(op, (self.fxnode, other.fxnode), pytype)
         return SymNode(out, self.shape_env, pytype, out_hint, fxnode=fxnode)
 
@@ -1369,19 +1374,11 @@ del func
 try:
     import z3
 
-    def _z3_wrap_literals(func):
-        def wrap(a):
-            if isinstance(a, (int, sympy.Integer)):
-                return z3.IntVal(int(a))
-            return a
-
-        @functools.wraps(func)
-        def wrapper(*args):
-            args = tuple(wrap(a) for a in args)
-            return func(*args)
-
-        return wrapper
-
+    # Implementation of Python semantics as Z3 expressions.
+    #
+    # Z3 Real-Int theory has operators with semantics that differ that of
+    # Python. Therefore, in order to get it right, we need to implement
+    # the (Python) semantics we are relying on in Z3.
     class Z3Ops:
         # The 2 functions below are used for conditionally casting between
         # integer and reals.
@@ -1415,22 +1412,58 @@ try:
         def mod(p: z3.ArithRef, q: z3.ArithRef) -> z3.ArithRef:
             return Z3Ops.to_int(p) % Z3Ops.to_int(q)
 
+    # Lifts a callable to be used in Z3.
+    #
+    # This function handles callables into callables that:
+    #
+    #   1. work as is with Z3 inhabitants
+    #   2. need to be replaced by their Z3 equals
+    #
+    # In both of them, we need to lift the arguments to live
+    # in Z3, before actually applying the operation.
     def _operator_to_z3(op: Callable) -> Callable:
+
+        # Lift literals, so that we can use them in Z3 functions.
+        def lift_literals(func):
+            def wrap(a):
+                if isinstance(a, (int, sympy.Integer)):
+                    return z3.IntVal(int(a))
+                return a
+
+            @functools.wraps(func)
+            def wrapper(*args):
+                args = tuple(wrap(a) for a in args)
+                return func(*args)
+
+            return wrapper
+
         replacement_map = {
-            operator.not_: _z3_wrap_literals(z3.Not),
-            operator.and_: _z3_wrap_literals(z3.And),
-            operator.floordiv: _z3_wrap_literals(Z3Ops.floordiv),
-            operator.truediv: _z3_wrap_literals(Z3Ops.div),
+            operator.not_: lift_literals(z3.Not),
+            operator.and_: lift_literals(z3.And),
+            operator.floordiv: lift_literals(Z3Ops.floordiv),
+            operator.truediv: lift_literals(Z3Ops.div),
+
+            # Not lifted because we only use this function as a
+            # marker for adding the expression as validator input.
             torch._assert: torch._assert,
         }
-        return replacement_map[op] if op in replacement_map else _z3_wrap_literals(op)
+        return replacement_map[op] if op in replacement_map else lift_literals(op)
 
+    # Processes an FX graph, populating the given validator.
+    #
+    # This function walks through each node in the FX graph, translating
+    # them into the Z3 world.
+    #
+    # Then, whenever it finds an 'torch._assert' call_function operation,
+    # it adds the Z3 expression corresponding to the argument as validator
+    # input.
     def _populate_validator_with_fx_graph(
             validator: "TranslationValidator",
             graph: torch.fx.Graph
     ) -> None:
         node_to_z3 = {}
 
+        # Creates a Z3 variable, taking into account the node type.
         def run_placeholder(node: torch.fx.Node) -> None:
             assert all(m in node.meta for m in ("pytype", "symbol")), (
                 f"info available: {node.meta}"
@@ -1450,19 +1483,20 @@ try:
             symbol = validator.symbol_to_z3(node.meta["symbol"])
             validator.add_assertion(placeholder == symbol)
 
+        # Actually runs the node target function (which is already
+        # lifted) with its arguments.
         def run_call_function(node: torch.fx.Node) -> None:
             args = [
                 node_to_z3[a]
                 if isinstance(a, torch.fx.Node) else a
                 for a in node.args
             ]
-            try:
-                node_to_z3[node] = node.target(*args)
-            except:
-                print(tuple((a, type(a)) for a in args))
-                print(node.format_node())
-                raise
 
+            assert callable(node.target)
+            node_to_z3[node] = node.target(*args)
+
+        # Adds the Z3 expression corresponding to the first argument
+        # as a validator input.
         def run_assertion(node: torch.fx.Node) -> None:
             assertion = node.args[0]
             assert isinstance(assertion, torch.fx.Node)
@@ -2238,28 +2272,36 @@ Outputs:
 Failed inputs:
 {failed_inputs}""")
 
-    def create_fx_call_function(self, op: Callable, args: Tuple, pytype: Optional[Type]) -> Optional[torch.fx.Node]:
+    def create_fx_call_function(
+            self,
+            op: Callable,
+            args: Tuple,
+            pytype: Optional[Type]
+    ) -> Optional[torch.fx.Node]:
+        # Cache this tuple in order to avoid dupplicated nodes.
         node_key = (op, args)
+
         if _translation_validator_enabled() and node_key not in self.graph_added_nodes:
+            # If translation validation is enabled, all arguments must have its
+            # own FX node.
             assert all(a is not None for a in args), f"missing arg in FX graph ({op.__name__}): {args}"
+
             node = self.tracer.create_node("call_function", _operator_to_z3(op), args, {})
             node.meta["pytype"] = pytype
             self.graph_added_nodes[node_key] = node
+
         return self.graph_added_nodes.get(node_key, None)
 
     def create_fx_placeholder(
             self,
             pytype: Type,
             name: Optional[str],
-            hint: Optional[int] = None,
             symbol: Optional[sympy.Symbol] = None,
-            unbacked: bool = False,
     ) -> Optional[torch.fx.Node]:
         if _translation_validator_enabled() and name is not None:
+            # Mangle the name.
             name = re.sub(r"[^a-zA-Z0-9]", "_", name)
             node = self.tracer.create_node("placeholder", name, (), {})
-            node.meta["hint"] = hint
-            node.meta["unbacked"] = unbacked
             node.meta["symbol"] = symbol
             node.meta["pytype"] = pytype
             return node
@@ -2394,7 +2436,7 @@ Failed inputs:
             if hint is not None:
                 assert int(sym) == hint
             return int(sym)
-        fxnode = self.create_fx_placeholder(int, name, hint, symbol=sym)
+        fxnode = self.create_fx_placeholder(int, name, symbol=sym)
         return SymInt(SymNode(sym, self, int, hint, fxnode=fxnode))
 
     def create_unbacked_symfloat(self):
@@ -2402,7 +2444,7 @@ Failed inputs:
         symbol: sympy.Symbol = sympy.Symbol(name)
         self.var_to_stack[symbol] = ''.join(traceback.format_list(traceback.extract_stack()[:-1]))
         self.var_to_range[symbol] = ValueRanges.unknown()
-        fxnode = self.create_fx_placeholder(float, name, unbacked=True, symbol=symbol)
+        fxnode = self.create_fx_placeholder(float, name, symbol=symbol)
         return SymFloat(SymNode(symbol, self, float, None, fxnode=fxnode))
 
     def create_unbacked_symint(self):
@@ -2410,7 +2452,7 @@ Failed inputs:
         symbol: sympy.Symbol = sympy.Symbol(name, integer=True)
         self.var_to_stack[symbol] = ''.join(traceback.format_list(traceback.extract_stack()[:-1]))
         self.var_to_range[symbol] = ValueRanges(-sys.maxsize - 1, sys.maxsize)
-        fxnode = self.create_fx_placeholder(int, name, unbacked=True, symbol=symbol)
+        fxnode = self.create_fx_placeholder(int, name, symbol=symbol)
         return SymInt(SymNode(symbol, self, int, None, fxnode=fxnode))
 
     def create_unbacked_symbool(self):
@@ -2422,7 +2464,7 @@ Failed inputs:
         # Necessary, since they are implicit constraints. i.e. guards might not
         # be issued because of them.
         self._add_output_guard(sympy.And(sympy.Eq(symbol, 0), sympy.Eq(symbol, 1)))  # type: ignore
-        fxnode = self.create_fx_placeholder(bool, name, unbacked=True, symbol=symbol)
+        fxnode = self.create_fx_placeholder(bool, name, symbol=symbol)
         return SymBool(SymNode(sympy.Eq(symbol, 1), self, bool, None, fxnode=fxnode))
 
     def create_symbol(
@@ -2849,6 +2891,8 @@ Failed inputs:
                 if vr.upper != sympy.oo:
                     self._add_output_guard(sympy.Le(sym, vr.upper))
 
+            # Before validating, populate the input of the validator with the
+            # built FX graph.
             _populate_validator_with_fx_graph(self.validator, self.tracer.graph)
 
         self._check_translation_validate()
