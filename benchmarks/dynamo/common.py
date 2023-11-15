@@ -630,9 +630,17 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs, **kwargs):
     return msg
 
 
-def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra):
+def raw_performance_experiment(args, model_iter_fn, model, example_inputs, optimize_ctx, tag):
     import contextlib
     from torch._inductor.utils import maybe_profile
+
+    @contextlib.contextmanager
+    def maybe_mark_profile(mark):
+        if args.profile:
+            with torch.profiler.record_function(mark):
+                yield
+        else:
+            yield
 
     timings = np.zeros(args.repeat, np.float64)
     times = args.iterations_per_run
@@ -644,21 +652,14 @@ def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra
     tolerance = args.xla_tolerance if args.trace_on_xla else 1e-4
     torch._dynamo.config.repro_tolerance = tolerance
 
-    @contextlib.contextmanager
-    def maybe_mark_profile(mark):
-        if args.profile:
-            with torch.profiler.record_function(mark):
-                yield
-        else:
-            yield
+    optimized = optimize_ctx(model_iter_fn)
+    begin_dynamo_stats = get_dynamo_stats()
+
+    if args.trace_on_xla:
+        xmetrics.clear_all()
 
     PROF_TIMED_STEP = "timed-step"
     with maybe_profile(args.profile) as prof:
-        if args.backend:
-            frozen_model_iter_fn = torch._dynamo.run(model_iter_fn)
-        else:
-            frozen_model_iter_fn = model_iter_fn
-
         for rep in trange(args.repeat, desc="running benchmark"):
             inputs = (
                 randomize_input(copy.deepcopy(example_inputs))
@@ -675,11 +676,21 @@ def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra
                 # Collect time in milliseconds instead of seconds.
                 timings[rep] = 1000 * timed(
                     model,
-                    frozen_model_iter_fn,
+                    optimized,
                     inputs,
                     times=times,
                     collect_outputs=args.collect_outputs,
                 )
+
+    dynamo_stats = get_dynamo_stats()
+    dynamo_stats.subtract(begin_dynamo_stats)
+
+    xla_metrics = {}
+    if args.trace_on_xla:
+        xla_metrics = {
+            "xla_compile": xmetrics.metric_data("CompileTime"),
+            "xla_execution": xmetrics.metric_data("ExecuteTime"),
+        }
 
     if args.export_profiler_trace:
         assert args.profile, "needs --profile for exporting its trace"
@@ -694,37 +705,66 @@ def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra
     first_headers = ["dev", "name", "batch_size", "niters", "repeat"]
     first_fields = [device, current_name, current_batch_size, times, args.repeat]
 
-    if "tag" in extra:
-        value = extra.pop("tag")
+    if tag is not None:
         first_headers.append("tag")
-        first_fields.append(value)
+        first_fields.append(tag)
 
     # Get the extension-less name of the output file
     base_output_filename = os.path.splitext(output_filename)[0]
 
     ############################################################################
-    # XLA Timings data file
+    # XLA Timings
+    xla_headers = []
+    xla_data = []
 
-    # Look for XLA timings and dump them into their own file.
-    for k in list(extra.keys()):
-        if re.match(r"xla_.*_timings", k):
+    for k, data in xla_metrics.items():
+        if data is not None and len(data) == 3:
+            metric = {
+                f"{k} number": data[0],
+                f"{k} (ms)": data[1] * 1.0e-6,
+            }
+            xla_headers += list(metric.keys())
+            xla_data += list(metric.values())
+
             filename = "_".join([base_output_filename, k]) + ".csv"
-            output_csv(filename, first_headers, first_fields + extra.pop(k))
+            output_csv(filename, first_headers, first_fields + [d[1] * 1.0e-6 for d in data[2]])
 
     ############################################################################
-    # Actual Timings summary file
+    # Dynamo Timings
+    dynamo_headers = list(dynamo_stats.keys())
+    dynamo_data = list(dynamo_stats.values())
+
+    for k, v in torch._dynamo.utils.compilation_time_metrics.items():
+        v_ms = [1000 * vi for vi in v]
+        metric = {
+            f"{k} (calls)": len(v),
+            f"{k} (ms)": sum(v_ms),
+        }
+        dynamo_headers += list(metric.keys())
+        dynamo_data += list(metric.values())
+
+    ############################################################################
+    # Statistica data
 
     # Run some stats on the raw timings
-    statsfn_names = ["min", "median", "max", "mean", "std"]
-    stats = [getattr(np, name)(timings) for name in statsfn_names]
+    sorted_timings = np.sort(timings)
+    timings = sorted_timings[1:-1]
 
-    headers = first_headers + statsfn_names
-    row = first_fields + stats
+    stats = {
+        "min (ms)": sorted_timings[0],
+        "median (ms)": np.median(timings),
+        "max (ms)": sorted_timings[-1],
+        "mean (ms)": np.mean(timings),
+        "std": np.std(timings),
+    }
 
-    # Append the extra fields
-    for k, v in extra.items():
-        headers.append(k)
-        row.append(v)
+    stats_headers = list(stats.keys())
+    stats_data = list(stats.values())
+
+    ############################################################################
+    # Profiling data
+    profile_headers = []
+    profile_data = []
 
     if args.profile:
         # Gather profiled data
@@ -735,11 +775,21 @@ def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra
             cpu_timings = np.array([evt.self_cpu_time_total for evt in step_events])
             cuda_timings = np.array([evt.self_cuda_time_total for evt in step_events])
 
-            headers.extend(["cpu_time", "cpu_time_std"])
-            row.extend([cpu_timings.sum(), cpu_timings.std()])
+            profiling = {
+                "cpu_time (ms)": cpu_timings.sum(),
+                "cpu_time_std": cpu_timings.std(),
+                "cuda_time (ms)": cuda_timings.sum(),
+                "cuda_time_std": cuda_timings.std(),
+            }
 
-            headers.extend(["cuda_time", "cuda_time_std"])
-            row.extend([cuda_timings.sum(), cuda_timings.std()])
+            profile_headers += list(profiling.keys())
+            profile_data += list(profiling.values())
+
+    ############################################################################
+    # Actual Timings summary file
+
+    headers = first_headers + stats_headers + dynamo_headers + xla_headers + profile_headers
+    row = first_fields + stats_data + dynamo_data + xla_data + profile_data
 
     # Write the performance data into the output file.
     output_csv(output_filename, headers, row)
@@ -747,15 +797,8 @@ def raw_performance_experiment(args, model_iter_fn, model, example_inputs, extra
     ############################################################################
     # Dynamo compilation time file
 
-    # Gather dynamo compile time data.
-    headers, data = torch._dynamo.utils.compile_times(repr="csv", aggregate=True)
-    compile_times_output_filename = base_output_filename + "_compilation_metrics.csv"
-
-    # Write dynamo compile time data into a new output file.
-    output_csv(compile_times_output_filename, first_headers + headers, first_fields + data)
-
-    MEAN = statsfn_names.index("mean")
-    STD = statsfn_names.index("std")
+    MEAN = "mean (ms)"
+    STD = "std"
     return f"{current_name}: took {stats[MEAN]:.2f} +- {stats[STD]:.2f}"
 
 
@@ -926,10 +969,7 @@ def speedup_experiment_onnx(
     median = np.median(timings, axis=0)
     speedup = median[0] / median[1]
     if args.dump_raw_metrics:
-        np.save(
-            f"{output_filename[:-4]}-raw_timings-{current_name}-{current_device}.npy",
-            timings,
-        )
+        metric.savemetric
 
     headers = ["dev", "name", "batch_size", "speedup", "abs_latency"]
     row = [
@@ -2501,55 +2541,8 @@ class BenchmarkRunner:
         # Export AOT Inductor not supported
         assert not self.args.export_aot_inductor
 
-        is_xla_device = self.args.trace_on_xla
-
-        # To be fair, we should also consider XLA/GPU as is_cuda_device.
-        # Problem is that we don't have access to torch.cuda API. That is,
-        # assuming we didn't compile PyTorch with CUDA support.
-        is_cuda_device = current_device == "cuda"
-
-        def warmup(fn, model, example_inputs, mode):
-            peak_mem = 0
-            start_stats = get_dynamo_stats()
-            xla_metrics = {}
-            try:
-                if is_cuda_device:
-                    torch.cuda.reset_peak_memory_stats()
-                    torch.cuda.empty_cache()
-                if is_xla_device:
-                    xmetrics.clear_all()
-                    xm.mark_step()
-                    xm.wait_device_ops()
-
-                t0 = time.perf_counter()
-
-                for _ in range(self.args.warmup_iterations):
-                    y = fn(model, example_inputs)
-                    maybe_mark_step(self.args)
-
-                t1 = time.perf_counter()
-                latency = 1000 * (t1 - t0)
-
-                if is_cuda_device:
-                    peak_mem = get_peak_memory()
-                elif is_xla_device:
-                    xm.wait_device_ops()
-                    xla_metrics = {
-                        "xla_compile": xmetrics.metric_data("CompileTime"),
-                        "xla_execution": xmetrics.metric_data("ExecuteTime"),
-                    }
-                elif current_device == "cpu":
-                    total = psutil.virtual_memory().total
-                    percentage = psutil.Process(os.getpid()).memory_percent()
-                    peak_mem = percentage * total / 10**9
-
-            except Exception:
-                log.exception("Backend %s failed in warmup()", mode)
-                return sys.exit(-1)
-
-            dynamo_stats = get_dynamo_stats()
-            dynamo_stats.subtract(start_stats)
-            return latency, peak_mem, dynamo_stats, xla_metrics
+        if not hasattr(model, name):
+            model.name = name
 
         # Cast the model to float16/float32 as necessary
         model, example_inputs = self.maybe_cast(model, example_inputs)
@@ -2559,38 +2552,9 @@ class BenchmarkRunner:
 
         self.init_optimizer(name, current_device, model.parameters())
         with self.pick_grad(name, self.args.training):
-            optimized_model_iter_fn = optimize_ctx(self.model_iter_fn)
-
-            # Run warmup for both eager and the optimized version
-            optimized_latency, optimized_peak_mem, dynamo_stats, xla_metrics = warmup(
-                optimized_model_iter_fn, model, example_inputs, "optimized"
-            )
-
-            extra = {}
-
-            if tag is not None:
-                extra["tag"] = tag
-
-            extra["optimized_warmup_time"] = optimized_latency
-            extra["optimized_peak_mem"] = optimized_peak_mem
-
-            for k, v in dynamo_stats.items():
-                extra[k] = v
-
-            for k, data in xla_metrics.items():
-                if data is not None and len(data) == 3:
-                    extra[f"{k}_number"] = data[0]
-                    extra[f"{k}_time"] = data[1] * 1.0e-9
-                    extra[f"{k}_timings"] = [d[1] * 1.0e-9 for d in data[2]]
-                elif is_xla_device:
-                    print("Warning: XLA execution returned None for metric:", k)
-
-            if not hasattr(model, name):
-                model.name = name
-
             # Support only raw_performance_experiment for this test.
             assert experiment.func == raw_performance_experiment
-            return experiment(model, example_inputs, extra)
+            return experiment(model, example_inputs, optimize_ctx, tag)
 
     def run_performance_test(
         self, name, model, example_inputs, optimize_ctx, experiment, tag=None
@@ -2852,9 +2816,6 @@ def parse_args(args=None):
     parser.add_argument("--device-index", help="CUDA device index")
     parser.add_argument(
         "--repeat", "-n", type=int, default=30, help="number of timing runs"
-    )
-    parser.add_argument(
-        "--warmup-iterations", type=int, default=5, help="number of warmup iterations"
     )
     iterations_per_run_help = """
         Run this may iterations for each time measurement. This is mainly used for
