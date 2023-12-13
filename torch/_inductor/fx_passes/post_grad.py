@@ -1082,7 +1082,7 @@ class MoveNodeToDevicePass:
             kwargs = node.kwargs.copy()
             kwargs["device"] = next(iter(target_devices))
             node.kwargs = kwargs
-
+        raise NotImplementedError(f"can't move: {node.format_node()}")
 
     def __call__(self, graph: fx.Graph) -> None:
         target_devices = set()
@@ -1155,7 +1155,7 @@ class MoveNodeToDevicePass:
                 # tensor. we can convert its cpu input to cuda without making further changes
                 node_device = self.get_node_device(user)
                 if (
-                    self.allows_cpu_device''(user)
+                    self.allows_cpu_device(user)
                     and node_device
                     and node_device.type == self.target
                 ):
