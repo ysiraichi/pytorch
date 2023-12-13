@@ -1077,10 +1077,10 @@ class MoveNodeToDevicePass:
 
         return cpu_indeg
 
-    def move_node(self, node: fx.Node) -> None:
+    def move_node(self, node: fx.Node, target_device: torch.device) -> None:
         if "device" in node.kwargs:
             kwargs = node.kwargs.copy()
-            kwargs["device"] = next(iter(target_devices))
+            kwargs["device"] = target_device
             node.kwargs = kwargs
         raise NotImplementedError(f"can't move: {node.format_node()}")
 
@@ -1104,7 +1104,7 @@ class MoveNodeToDevicePass:
         movable_nodes = self.find_movable_nodes(graph, candidates)
 
         for node in movable_nodes:
-            self.move_node(node)
+            self.move_node(node, next(iter(target_devices)))
 
     def find_movable_nodes(
         self, graph: fx.Graph, candidates: List[fx.Node]
