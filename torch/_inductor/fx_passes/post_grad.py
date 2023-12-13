@@ -1155,7 +1155,7 @@ class MoveNodeToDevicePass:
                 # tensor. we can convert its cpu input to cuda without making further changes
                 node_device = self.get_node_device(user)
                 if (
-                    self.allows_cpu_device(user)
+                    self.allow_cpu_device(user)
                     and node_device
                     and node_device.type == self.target
                 ):
