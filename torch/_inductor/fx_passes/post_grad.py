@@ -1082,7 +1082,8 @@ class MoveNodeToDevicePass:
             kwargs = node.kwargs.copy()
             kwargs["device"] = target_device
             node.kwargs = kwargs
-        raise NotImplementedError(f"can't move: {node.format_node()}")
+        else:
+            raise NotImplementedError(f"can't move: {node.format_node()}")
 
     def __call__(self, graph: fx.Graph) -> None:
         target_devices = set()
