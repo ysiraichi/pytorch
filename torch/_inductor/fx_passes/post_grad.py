@@ -1043,7 +1043,7 @@ class MoveNodeToDevicePass:
         return False
 
     def is_movable_candidate(self, node: fx.Node) -> bool:
-        return not (
+        return (
             not self.cannot_be_moved(node)
             and torch._subclasses.fake_tensor._is_tensor_constructor(node.target)
             and node.kwargs.get("device") == torch.device("cpu")
