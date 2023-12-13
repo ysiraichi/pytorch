@@ -986,7 +986,7 @@ def fused_int_mm_mul(match: Match, mat1, mat2, mat3, out_dtype=None):
     return inductor.kernel.mm.tuned_fused_int_mm_mul(mat1, mat2, mat3, out_dtype)
 
 
-class MoveNodesToDevicePass:
+class MoveNodeToDevicePass:
     def __init__(self, target: str, allow_outputs: bool = False) -> None:
         """
         Move nodes from cpu to the target_device.
@@ -1010,7 +1010,7 @@ class MoveNodesToDevicePass:
             f"Got: {type(target).__name__}"
         )
 
-    def allows_cpu_device(self, node: fx.Node) -> bool:
+    def allow_cpu_device(self, node: fx.Node) -> bool:
         """
         Returns whether a node that returns a tensor on the target device may have
         cpu tensors as input.
@@ -1077,7 +1077,7 @@ class MoveNodesToDevicePass:
 
         return cpu_indeg
 
-    def move_node(self, fx.Node) -> None:
+    def move_node(self, node: fx.Node) -> None:
         if "device" in node.kwargs:
             kwargs = node.kwargs.copy()
             kwargs["device"] = next(iter(target_devices))
@@ -1187,4 +1187,4 @@ def move_constructors_to_cuda(graph: fx.Graph) -> None:
     """
     Moves intermediary tensors which are constructed on the cpu to cuda when safe
     """
-    MoveNodesToDevicePass("cuda")(graph)
+    MoveNodeToDevicePass("cuda")(graph)
