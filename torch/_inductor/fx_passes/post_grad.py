@@ -986,17 +986,17 @@ def fused_int_mm_mul(match: Match, mat1, mat2, mat3, out_dtype=None):
     return inductor.kernel.mm.tuned_fused_int_mm_mul(mat1, mat2, mat3, out_dtype)
 
 
-class ConstructorMoverPass:
+class MoveNodesToDevicePass:
     def __init__(self, target: str, allow_outputs: bool = False) -> None:
         """
-        Move constructors from cpu to the target_device.
+        Move nodes from cpu to the target_device.
 
-        Sweeps through the module, looking for constructor nodes that can be moved
+        Sweeps through the module, looking for candidate nodes that can be moved
         to the target_device.
 
-        A constructor node can be moved to the target_device iff all of its users
-        can also be moved (tested by cannot_be_moved). Otherwise, all dependent
-        constructor nodes won't be moved.
+        A candidate node (tested by is_movable_candidate) can be moved to the
+        target_device iff all of its users can also be moved (tested by cannot_be_moved).
+        Otherwise, all dependent candidate nodes won't be moved.
 
         - target: target device type
         - allow_outputs: allow outputs to be moved
@@ -1010,7 +1010,7 @@ class ConstructorMoverPass:
             f"Got: {type(target).__name__}"
         )
 
-    def allow_cpu_device(self, node: fx.Node) -> bool:
+    def allows_cpu_device(self, node: fx.Node) -> bool:
         """
         Returns whether a node that returns a tensor on the target device may have
         cpu tensors as input.
@@ -1042,6 +1042,13 @@ class ConstructorMoverPass:
 
         return False
 
+    def is_movable_candidate(self, node: fx.Node) -> bool:
+        return not (
+            not self.cannot_be_moved(node)
+            and torch._subclasses.fake_tensor._is_tensor_constructor(node.target)
+            and node.kwargs.get("device") == torch.device("cpu")
+        )
+
     def get_node_device(self, node: fx.Node) -> Optional[torch.device]:
         """
         Get the device of a node.
@@ -1070,60 +1077,55 @@ class ConstructorMoverPass:
 
         return cpu_indeg
 
-    def __call__(self, graph: fx.Graph) -> None:
-        target_devices = set()
-        constructors = []
-
-        for node in graph.nodes:
-            device = self.get_node_device(node)
-            if device and device.type == self.target:
-                target_devices.add(device)
-
-            if not (
-                isinstance(node.target, torch._ops.OpOverload)
-                and node.target.namespace in ("prims", "aten")
-            ):
-                continue
-
-            if not torch._subclasses.fake_tensor._is_tensor_constructor(node.target):
-                continue
-
-            if not node.kwargs.get("device") == torch.device("cpu"):
-                continue
-
-            constructors.append(node)
-
-        # not handling multiple target devices initially
-        if not constructors or len(target_devices) != 1:
-            return
-
-        movable_constructors = self.find_movable_constructors(graph, constructors)
-
-        for node in movable_constructors:
+    def move_node(self, fx.Node) -> None:
+        if "device" in node.kwargs:
             kwargs = node.kwargs.copy()
             kwargs["device"] = next(iter(target_devices))
             node.kwargs = kwargs
 
-    def find_movable_constructors(
-        self, graph: fx.Graph, constructors: List[fx.Node]
+
+    def __call__(self, graph: fx.Graph) -> None:
+        target_devices = set()
+        candidates = []
+
+        for node in graph.nodes:
+            device = self.get_node_device(node)
+
+            if device and device.type == self.target:
+                target_devices.add(device)
+
+            if self.is_movable_candidate(node):
+                candidates.append(node)
+
+        # not handling multiple target devices initially
+        if not candidates or len(target_devices) != 1:
+            return
+
+        movable_nodes = self.find_movable_nodes(graph, candidates)
+
+        for node in movable_nodes:
+            self.move_node(node)
+
+    def find_movable_nodes(
+        self, graph: fx.Graph, candidates: List[fx.Node]
     ) -> Set[fx.Node]:
         """
-        Starting from the cpu constructors, iterate through the graph and test that all of their
+        Starting from the candidate nodes, iterate through the graph and test that all of their
         downstream uses can safely be moved to cpu.
         """
         cpu_indeg: Dict[fx.Node, int] = self.get_cpu_indeg_count(graph)
 
-        # which constructors cannot be moved to cuda
+        # which nodes cannot be moved to cuda
         cannot_move_to_cuda: Set[fx.Node] = set()
 
-        # For any node in the graph, which constructors does it have a dependency on
-        constructor_dependencies: Dict[fx.Node, Set[fx.Node]] = defaultdict(set)
+        # For any node in the graph, which candidates does it have a dependency on
+        candidate_dependencies: Dict[fx.Node, Set[fx.Node]] = defaultdict(set)
 
-        # if a cpu node has a dependency on two different cpu constructors,
-        # then if either constructor cannot be moved to cuda, the other cannot as well.
+        # if a cpu node has a dependency on two different cpu candidates,
+        # then if either candidate cannot be moved to cuda, the other cannot as well.
         # In this case any node with a dependency on one will have a dependency on the other
-        equal_constructor_sets: Dict[fx.Node, Set[fx.Node]] = {
-            c: {c} for c in constructors
+        equal_candidate_sets: Dict[fx.Node, Set[fx.Node]] = {
+            c: {c} for c in candidates
         }
 
         def make_dependencies_equivalent(
@@ -1132,17 +1134,17 @@ class ConstructorMoverPass:
             # could use union find but not worth complexity here
             set1.update(set2)
             for obj in set1:
-                equal_constructor_sets[obj] = set1
+                equal_candidate_sets[obj] = set1
             return set1
 
-        queue: List[fx.Node] = list(constructors)
+        queue: List[fx.Node] = list(candidates)
 
         for c in queue:
-            constructor_dependencies[c].add(c)
+            candidate_dependencies[c].add(c)
 
         while queue:
             node = queue.pop()
-            dependencies = constructor_dependencies[node]
+            dependencies = candidate_dependencies[node]
 
             for user in node.users:
                 if self.cannot_be_moved(user):
@@ -1153,7 +1155,7 @@ class ConstructorMoverPass:
                 # tensor. we can convert its cpu input to cuda without making further changes
                 node_device = self.get_node_device(user)
                 if (
-                    self.allow_cpu_device(user)
+                    self.allows_cpu_device''(user)
                     and node_device
                     and node_device.type == self.target
                 ):
@@ -1166,23 +1168,23 @@ class ConstructorMoverPass:
                         queue.append(user)
 
                 unioned_set = make_dependencies_equivalent(
-                    dependencies, constructor_dependencies[user]
+                    dependencies, candidate_dependencies[user]
                 )
-                constructor_dependencies[user] = unioned_set
+                candidate_dependencies[user] = unioned_set
 
         for node in cpu_indeg:
-            if constructor_dependencies[node]:
-                cannot_move_to_cuda.update(constructor_dependencies[node])
+            if candidate_dependencies[node]:
+                cannot_move_to_cuda.update(candidate_dependencies[node])
 
         all_cannot_move_to_cuda = cannot_move_to_cuda.copy()
-        for constructor in cannot_move_to_cuda:
-            all_cannot_move_to_cuda.update(equal_constructor_sets[constructor])
+        for candidate in cannot_move_to_cuda:
+            all_cannot_move_to_cuda.update(equal_candidate_sets[candidate])
 
-        return set(constructors) - all_cannot_move_to_cuda
+        return set(candidates) - all_cannot_move_to_cuda
 
 
 def move_constructors_to_cuda(graph: fx.Graph) -> None:
     """
     Moves intermediary tensors which are constructed on the cpu to cuda when safe
     """
-    ConstructorMoverPass("cuda")(graph)
+    MoveNodesToDevicePass("cuda")(graph)
