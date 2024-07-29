@@ -2,6 +2,8 @@
 
 import logging
 
+from torch._guards import TracingContext
+
 from functorch.compile import make_boxed_func
 
 from ..backends.common import aot_autograd
@@ -29,12 +31,13 @@ def xla_backend_helper(model, fake_tensor_inputs, boxed=False):
         ) from e
 
     compiled_graph = None
+    tracing_context = TracingContext.get()
 
     def fwd(*args):
         nonlocal model
         nonlocal compiled_graph
         if compiled_graph is None:
-            compiled_graph = bridge.extract_compiled_graph(model, args)
+            compiled_graph = bridge.extract_compiled_graph(model, args, tracing_context)
             del model
         return compiled_graph(*args)
 

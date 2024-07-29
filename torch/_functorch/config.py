@@ -69,6 +69,8 @@ from torch._inductor.config import is_fbcode
 # serializable before enabling warm cache with this config turned on.
 view_replay_for_aliased_outputs = (not is_fbcode()) and (not enable_autograd_cache)
 
+skip_view_reconstruction = False
+
 # Restricts the amount of computation AOTAutograd can do.
 # NB: We have essentially disabled this heuristic now. However, this is kept
 # here for now in case it's useful. Setting it low can artificially reduce the

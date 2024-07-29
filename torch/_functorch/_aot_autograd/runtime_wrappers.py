@@ -174,10 +174,12 @@ class AliasOfInputHandler:
         self.functional_tensor = info.functional_tensor
         self.replay_views = config.view_replay_for_aliased_outputs
 
+    def base(self, orig_inputs, fw_outs):
+        return orig_inputs[self.base_idx]
+
     def __call__(self, orig_inputs, fw_outs, out):
-        aliased_base_tensor = orig_inputs[self.base_idx]
         return gen_alias_from_base(
-            aliased_base_tensor,
+            self.base(orig_inputs, fw_outs),
             self.unwrap_out(out),
             self.requires_grad,
             self.functional_tensor,
@@ -212,10 +214,12 @@ class AliasOfIntermediateHandler:
         self.functional_tensor = info.functional_tensor
         self.replay_views = config.view_replay_for_aliased_outputs
 
+    def base(self, orig_inputs, fw_outs):
+        return fw_outs[self.base_idx]
+
     def __call__(self, orig_inputs, fw_outs, out):
-        aliased_base_tensor = fw_outs[self.base_idx]
         return gen_alias_from_base(
-            aliased_base_tensor,
+            self.base(orig_inputs, fw_outs),
             self.unwrap_out(out),
             self.requires_grad,
             self.functional_tensor,
@@ -426,7 +430,7 @@ def _create_runtime_wrapper(
             )
             assert len(fw_outs) == expect_num_outputs
             ret_outs = [
-                handler(orig_inputs, fw_outs, out)
+                handler(orig_inputs, fw_outs, out) if not config.skip_view_reconstruction else out
                 for out, handler in builtins.zip(fw_outs, output_handlers)
             ]
         else:

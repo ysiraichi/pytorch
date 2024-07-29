@@ -152,6 +152,18 @@ FunctionalTensorWrapper::FunctionalTensorWrapper(const Tensor& view_value, const
   storage_ = base->storage_; // alias this tensor's storage with the base tensor's
 }
 
+FunctionalTensorWrapper::FunctionalTensorWrapper(const Tensor& value, const FunctionalTensorWrapper* storage_source, const FunctionalTensorWrapper* view_metas_source)
+  : c10::TensorImpl(
+      c10::DispatchKeySet(DispatchKey::Functionalize) | value.key_set(),
+      value.dtype(),
+      value.device()
+    ),
+  value_(value),
+  view_metas_(view_metas_source->view_metas_)
+{
+  storage_ = storage_source->storage();
+  generation_ = functional_storage_impl()->generation();
+}
 
 functionalization::FunctionalStorageImpl* FunctionalTensorWrapper::functional_storage_impl() const {
   return static_cast<functionalization::FunctionalStorageImpl*>(storage_.unsafeGetStorageImpl());

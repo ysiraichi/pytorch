@@ -58,6 +58,11 @@ struct TORCH_API FunctionalTensorWrapper : public c10::TensorImpl {
       const FunctionalTensorWrapper* base,
       const functionalization::ViewMeta& meta);
 
+  explicit FunctionalTensorWrapper(
+      const Tensor& value,
+      const FunctionalTensorWrapper* storage_source,
+      const FunctionalTensorWrapper* view_metas_source);
+
   // Get the underlying, actual tensor, that doesn't know anything about
   // functionalization.
   const Tensor& value() const {
