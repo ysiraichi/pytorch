@@ -31,13 +31,13 @@ def xla_backend_helper(model, fake_tensor_inputs, boxed=False):
         ) from e
 
     compiled_graph = None
-    tracing_context = TracingContext.get()
+    metadata = TracingContext.get().fw_metadata
 
     def fwd(*args):
         nonlocal model
         nonlocal compiled_graph
         if compiled_graph is None:
-            compiled_graph = bridge.extract_compiled_graph(model, args, tracing_context)
+            compiled_graph = bridge.extract_compiled_graph(model, args, metadata)
             del model
         return compiled_graph(*args)
 
