@@ -6297,6 +6297,59 @@ _create_binary_float_meta_func(aten.special_laguerre_polynomial_l)
 _create_binary_float_meta_func(aten.special_legendre_polynomial_p)
 
 
+@register_meta(aten.lerp)
+def lerp(start, end, weight):
+    torch._check(start.dtype == end.dtype, lambda: f"expected dtype {start.dtype} for `end`, but got dtype {end.dtype}")
+    args = [start, end]
+    if isinstance(weight, TensorLike):
+        torch._check(start.dtype == weight.dtype, lambda: f"expected dtype {start.dtype} for `weight`, but got dtype {weight.dtype}")
+        args.append(weight)
+    return elementwise_meta(*args, type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT)
+
+
+@register_meta(aten.lerp_)
+def lerp_(self, end, weight):
+    out = lerp(self, end, weight)
+    self, _ = _maybe_broadcast(self, out)
+    return self
+
+
+@register_meta(aten.addcmul)
+def addcmul(input, tensor1, tensor2, *, value):
+    return elementwise_meta(input, tensor1, tensor2, type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT)
+
+
+@register_meta(aten.addcmul_)
+def addcmul_(self, tensor1, tensor2, *, value):
+    out = addcmul(self, tensor1, tensor2, value=value)
+    self, _ = _maybe_broadcast(self, out)
+    return self
+
+@register_meta(aten.addcdiv)
+def addcdiv(input, tensor1, tensor2, *, value):
+    torch._check(
+        not (utils.is_integer_dtype(tensor1.dtype) and utils.is_integer_dtype(tensor2.dtype)),
+        lambda: (
+            "Integer division with addcdiv is no longer supported, and in a future ",
+            "release addcdiv will perform a true division of tensor1 and tensor2. ",
+            "The historic addcdiv behavior can be implemented as ",
+            "(input + value * torch.trunc(tensor1 / tensor2)).to(input.dtype) ",
+            "for integer inputs and as ",
+            "(input + value * tensor1 / tensor2) for float inputs. ",
+            "The future addcdiv behavior is just the latter implementation: ",
+            "(input + value * tensor1 / tensor2), for all dtypes."
+        )
+    )
+    return elementwise_meta(input, tensor1, tensor2, type_promotion=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT)
+
+
+@register_meta(aten.addcdiv_)
+def addcdiv_(self, tensor1, tensor2, *, value):
+    out = addcdiv(self, tensor1, tensor2, value=value)
+    self, _ = _maybe_broadcast(self, out)
+    return self
+
+
 # We must also trigger meta registrations from PrimTorch ref
 # decompositions
 import torch._refs
